@@ -1,17 +1,16 @@
 /* ============================================================
- * 6Lottery Autobet — Professional Panel
+ * 6Lottery Autobet — Professional Panel v3
  * Single-file floating UI + strategy engine
  * Usage:
  *   Console:  fetch('URL').then(r=>r.text()).then(eval)
  *   Bookmark: javascript:(()=>fetch('URL').then(r=>r.text()).then(eval))()
- *   Tamper:   // ==UserScript== ... @match site ... 
+ *   Tamper:   @match site ... (auto-run)
  * ============================================================ */
 (function AUTOBET_PRO() {
     'use strict';
 
-    /* ── Prevent double-inject ─────────────────────────────── */
     if (window.__AUTOBET_PRO__) {
-        window.__AUTOBET_PRO__.panel.classList.add('open');
+        window.__AUTOBET_PRO__.ui.open();
         return;
     }
 
@@ -50,21 +49,16 @@
         resultTimeoutMs: 90000,
         maxConsecutiveErrors: 10,
         balanceWarnRatio: 3,
-        autoRefreshToken: true,
-        colorBet: 'G',
         customBetPattern: 'B,S,B,B,S',
-        dreamMapEnabled: true,
         leoBigPattern: 'BBSBBSBBSB',
         leoSmallPattern: 'SSBSSBSSBS',
         trendWaitCount: 0,
         alternateWaitCount: 0
     };
 
-    const LS_KEY = 'autobet_pro_cfg_v2';
-    const LS_LOG = 'autobet_pro_log_v2';
+    const LS_KEY = 'autobet_pro_cfg_v3';
 
     let cfg = Object.assign({}, DEFAULT_CFG, safeJSON(localStorage.getItem(LS_KEY)) || {});
-
     function safeJSON(s) { try { return JSON.parse(s); } catch (e) { return null; } }
 
     /* ══════════════════════════════════════════════════════════
@@ -74,7 +68,6 @@
         running: false,
         stopRequested: false,
         token: null,
-        tokenHeader: '',
         baseUrl: '',
         origin: '',
         drawHost: '',
@@ -88,7 +81,6 @@
         history: [],
         logs: [],
 
-        // strategy state
         patternIdx: 0,
         customPatternIdx: 0,
         martinIndex: 0,
@@ -98,7 +90,7 @@
         skipMode: false,
         entryLayerState: { waiting: false, lossStreak: 0 },
         slSkipWaitingWin: false,
-        sniper: { active: false, dir: null, idx: 0, seq: [], hits: 0, sameResult: false },
+        sniper: { active: false, dir: null, idx: 0, seq: [], hits: 0 },
         dream: { first: true, pattern: null, idx: 0 },
         leo: { idx: 0 },
         babio: { pos: 8 },
@@ -107,11 +99,10 @@
         trendState: { last: null, skip: false },
         altState: { last: null, skip: false },
 
-        // history buffers
-        lastResults: [],   // ['B','S',...] recent first
-        lastNumbers: [],   // ['0'...'9']
-        lastColors: [],    // ['G','V','R']
-        rawHistory: []     // full result objects recent first
+        lastResults: [],
+        lastNumbers: [],
+        lastColors: [],
+        rawHistory: []
     };
 
     /* ══════════════════════════════════════════════════════════
@@ -129,14 +120,7 @@
         const line = { t: ts(), m: msg, c: cls };
         S.logs.push(line);
         if (S.logs.length > 500) S.logs.shift();
-        if (UI.logEl) {
-            const d = document.createElement('div');
-            d.className = 'ab-line ' + cls;
-            d.textContent = `[${line.t}] ${msg}`;
-            UI.logEl.appendChild(d);
-            UI.logEl.scrollTop = UI.logEl.scrollHeight;
-            while (UI.logEl.children.length > 300) UI.logEl.removeChild(UI.logEl.firstChild);
-        }
+        UI.pushLog(line);
         console.log(`[AUTOBET ${line.t}] ${msg}`);
     }
 
@@ -182,7 +166,6 @@
                 }
             }
         }
-        // fallback: window globals
         for (const g of ['token', 'authToken', 'accessToken', '__token__']) {
             try {
                 const v = window[g];
@@ -203,7 +186,7 @@
     }
 
     /* ══════════════════════════════════════════════════════════
-     * 5. API LAYER
+     * 5. API
      * ══════════════════════════════════════════════════════════ */
     function resolveSite() {
         const s = SITES[cfg.site] || SITES['6Lottery'];
@@ -225,7 +208,7 @@
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json;charset=UTF-8',
-                'Authorization': (S.tokenHeader || '') + S.token,
+                'Authorization': S.token,
                 'Ar-Origin': S.origin,
                 'Origin': S.origin,
                 'Referer': S.origin + '/'
@@ -236,15 +219,9 @@
         return res.json();
     }
 
-    function typeIdFor(gameType) {
-        return ({ TRX: 13, WINGO: 1, WINGO_30S: 30, WINGO_3MIN: 2, WINGO_5MIN: 3 })[gameType] || 1;
-    }
-    function issueEndpoint(gameType) {
-        return gameType === 'TRX' ? 'GetTrxGameIssue' : 'GetGameIssue';
-    }
-    function betEndpoint(gameType) {
-        return gameType === 'TRX' ? 'GameTrxBetting' : 'GameBetting';
-    }
+    function typeIdFor(g) { return ({ TRX: 13, WINGO: 1, WINGO_30S: 30, WINGO_3MIN: 2, WINGO_5MIN: 3 })[g] || 1; }
+    function issueEndpoint(g) { return g === 'TRX' ? 'GetTrxGameIssue' : 'GetGameIssue'; }
+    function betEndpoint(g) { return g === 'TRX' ? 'GameTrxBetting' : 'GameBetting'; }
 
     async function fetchBalance() {
         const r = await api('GetBalance', { language: 7 });
@@ -288,7 +265,7 @@
     }
 
     /* ══════════════════════════════════════════════════════════
-     * 6. STRATEGY ENGINE
+     * 6. STRATEGY
      * ══════════════════════════════════════════════════════════ */
     function selectMap() {
         return cfg.betType === 'COLOR'
@@ -305,7 +282,6 @@
     }
 
     function seedResults(list) {
-        // list is newest first from API
         const ordered = list.slice(0, 30).reverse();
         for (const item of ordered) {
             if (!item || item.number === undefined) continue;
@@ -320,46 +296,35 @@
         const lastNum = S.lastNumbers;
 
         switch (strat) {
-
             case 'BS_ORDER': {
                 const p = (cfg.bsPattern || 'BS').replace(/[^BS]/g, '') || 'BS';
-                const ch = p[S.patternIdx % p.length];
-                return { ch, advance: true };
+                return { ch: p[S.patternIdx % p.length], advance: true };
             }
-
             case 'CUSTOM_PATTERN': {
                 const items = cfg.customBetPattern.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
                 if (!items.length) return { ch: 'B', advance: true };
                 return { ch: items[S.customPatternIdx % items.length], advance: true };
             }
-
             case 'TREND_FOLLOW': {
                 if (cfg.betType === 'COLOR') {
                     if (!S.colorTrend.last) {
-                        const pick = ['G', 'V', 'R'][Math.floor(Math.random() * 3)];
-                        return { ch: pick, advance: true };
+                        return { ch: ['G', 'V', 'R'][Math.floor(Math.random() * 3)], advance: true };
                     }
                     return { ch: S.colorTrend.last, advance: true };
                 }
-                // BS trend: wait filter
                 if (cfg.trendWaitCount > 0) {
                     const need = cfg.trendWaitCount * 2;
                     if (last.length >= need) {
                         const tail = last.slice(-need).join('');
                         const bs = 'BS'.repeat(cfg.trendWaitCount);
                         const sb = 'SB'.repeat(cfg.trendWaitCount);
-                        if (tail === bs || tail === sb) {
-                            S.trendState.skip = true;
-                        } else {
-                            S.trendState.skip = false;
-                        }
+                        S.trendState.skip = (tail === bs || tail === sb);
                     }
                     if (S.trendState.skip) return { ch: null, skip: true, reason: 'BS/SB Wait' };
                 }
                 if (!S.trendState.last) return { ch: 'B', advance: true };
                 return { ch: S.trendState.last, advance: true };
             }
-
             case 'ALTERNATE': {
                 if (cfg.alternateWaitCount > 0) {
                     const need = cfg.alternateWaitCount * 2;
@@ -367,11 +332,7 @@
                         const tail = last.slice(-need).join('');
                         const bb = 'BB'.repeat(cfg.alternateWaitCount);
                         const ss = 'SS'.repeat(cfg.alternateWaitCount);
-                        if (tail === bb || tail === ss) {
-                            S.altState.skip = true;
-                        } else {
-                            S.altState.skip = false;
-                        }
+                        S.altState.skip = (tail === bb || tail === ss);
                     }
                     if (S.altState.skip) {
                         const opp = S.altState.last === 'B' ? 'S' : 'B';
@@ -381,44 +342,34 @@
                 if (!S.altState.last) return { ch: 'B', advance: true };
                 return { ch: S.altState.last === 'B' ? 'S' : 'B', advance: true };
             }
-
             case 'AI_PREDICTION': {
                 if (!last.length) return { ch: 'B', advance: true };
-                const window10 = last.slice(-10);
+                const w = last.slice(-10);
                 const counts = { B: 0, S: 0 };
-                window10.forEach(r => counts[r]++);
-                const last3 = window10.slice(-3).join('');
+                w.forEach(r => counts[r]++);
+                const last3 = w.slice(-3).join('');
                 if (last3 === 'BBB') return { ch: 'S', advance: true };
                 if (last3 === 'SSS') return { ch: 'B', advance: true };
                 if (counts.B === counts.S) return { ch: last[last.length - 1], advance: true };
                 return { ch: counts.B > counts.S ? 'B' : 'S', advance: true };
             }
-
             case 'BABIO': {
                 if (!last.length) return { ch: 'B', advance: true };
-                const pos = S.babio.pos;
-                const idx = last.length - pos;
+                const idx = last.length - S.babio.pos;
                 if (idx >= 0) return { ch: last[idx], advance: true };
                 return { ch: last[last.length - 1], advance: true };
             }
-
             case 'DREAM': {
-                if (!S.dream.pattern) {
-                    S.dream.first = false;
-                    return { ch: 'B', advance: true };
-                }
+                if (!S.dream.pattern) return { ch: 'B', advance: true };
                 if (S.dream.idx >= S.dream.pattern.length) S.dream.idx = 0;
                 return { ch: S.dream.pattern[S.dream.idx], advance: true };
             }
-
             case 'LEO': {
                 if (!last.length) return { ch: 'B', advance: true };
                 const lastRes = last[last.length - 1];
                 const pattern = lastRes === 'B' ? cfg.leoBigPattern : cfg.leoSmallPattern;
-                const ch = pattern[S.leo.idx % pattern.length];
-                return { ch, advance: true };
+                return { ch: pattern[S.leo.idx % pattern.length], advance: true };
             }
-
             case 'ALINKAR': {
                 if (!last.length) return { ch: Math.random() < 0.5 ? 'B' : 'S', advance: true };
                 const lastRes = last[last.length - 1];
@@ -431,7 +382,6 @@
                 if (streak === 3) return { ch: lastRes === 'B' ? 'S' : 'B', advance: true };
                 return { ch: lastRes, advance: true };
             }
-
             case 'MAY_BARANI': {
                 if (last.length < 5) return { ch: last[last.length - 1] || 'B', advance: true };
                 const recent = last.slice(-5).map(r => r === 'B' ? 7 : 2);
@@ -439,14 +389,12 @@
                 const v = Math.abs(sum) % 10;
                 return { ch: v >= 5 ? 'B' : 'S', advance: true };
             }
-
             case 'BEATRIX': {
                 if (S.beatrix.waiting) return { ch: null, skip: true, reason: 'Waiting for 7' };
                 const digit = parseInt(String(S.beatrix.period).slice(-1), 10);
                 const ch = [0, 1, 2, 3, 7].includes(digit) ? 'S' : 'B';
                 return { ch, advance: true };
             }
-
             case 'SNIPER': {
                 const sn = S.sniper;
                 if (!sn.active && lastNum.length) {
@@ -456,16 +404,14 @@
                 }
                 if (!sn.active) return { ch: null, skip: true, reason: 'SNIPER waiting' };
                 if (sn.idx >= sn.seq.length) sn.seq.push(sn.dir);
-                return { ch: sn.seq[sn.idx], advance: true, sniper: true };
+                return { ch: sn.seq[sn.idx], advance: true };
             }
-
             default:
                 return { ch: 'B', advance: true };
         }
     }
 
     function postBetState(choice, isWin, num, issue) {
-        // Update per-strategy internal state after result
         const strat = cfg.strategy;
 
         if (strat === 'DREAM') {
@@ -481,35 +427,21 @@
                 S.dream.idx++;
             }
         }
-
-        if (strat === 'LEO') {
-            S.leo.idx++;
-        }
-
-        if (strat === 'BABIO') {
-            if (!isWin) S.babio.pos = S.babio.pos === 8 ? 5 : 8;
-        }
-
+        if (strat === 'LEO') S.leo.idx++;
+        if (strat === 'BABIO' && !isWin) S.babio.pos = S.babio.pos === 8 ? 5 : 8;
         if (strat === 'BEATRIX') {
-            if (num === '7') {
-                S.beatrix.waiting = false;
-                S.beatrix.period = issue;
-            } else {
-                S.beatrix.waiting = true;
-            }
+            if (num === '7') { S.beatrix.waiting = false; S.beatrix.period = issue; }
+            else S.beatrix.waiting = true;
         }
-
         if (strat === 'TREND_FOLLOW') {
             S.trendState.last = numberToBS(num);
             if (cfg.betType === 'COLOR') S.colorTrend.last = numberToColor(num);
             if (S.trendState.skip && isWin) S.trendState.skip = false;
         }
-
         if (strat === 'ALTERNATE') {
             S.altState.last = numberToBS(num);
             if (S.altState.skip && isWin) S.altState.skip = false;
         }
-
         if (strat === 'SNIPER' && S.sniper.active) {
             if (isWin) {
                 S.sniper.hits++;
@@ -518,13 +450,13 @@
                 S.sniper.idx = 0;
                 log(`🎯 SNIPER hit ${S.sniper.hits}/2`, 'ok');
                 if (S.sniper.hits >= 2) {
-                    log('🏁 SNIPER 2/2 — stopping bot', 'ok');
+                    log('🏁 SNIPER 2/2 — stopping', 'ok');
                     S.stopRequested = true;
                 }
             } else {
                 S.sniper.idx++;
                 if (S.sniper.idx >= 4) {
-                    log('❌ SNIPER max bets reached — stopping', 'err');
+                    log('❌ SNIPER max bets — stopping', 'err');
                     S.stopRequested = true;
                 }
             }
@@ -532,7 +464,7 @@
     }
 
     /* ══════════════════════════════════════════════════════════
-     * 7. BETTING SIZE (Martingale / Anti / D'Alembert / Custom)
+     * 7. BET SIZE
      * ══════════════════════════════════════════════════════════ */
     function currentBetAmount() {
         const bs = cfg.betSizes;
@@ -556,46 +488,33 @@
                 S.dalembertUnits = isWin ? Math.max(1, S.dalembertUnits - 1) : S.dalembertUnits + 1;
                 break;
             case 'Custom':
-                if (isWin) S.customIdx = Math.max(0, S.customIdx - 1);
-                else S.customIdx = Math.min(len - 1, S.customIdx + 1);
+                S.customIdx = isWin ? Math.max(0, S.customIdx - 1) : Math.min(len - 1, S.customIdx + 1);
                 break;
         }
     }
 
     /* ══════════════════════════════════════════════════════════
-     * 8. ENTRY LAYER + SL LAYER
+     * 8. LAYERS
      * ══════════════════════════════════════════════════════════ */
     function shouldSkipByEntryLayer() {
         if (cfg.entryLayer === 1) return false;
-        if (cfg.entryLayer === 2) {
-            return S.entryLayerState.waiting;
-        }
-        if (cfg.entryLayer === 3) {
-            return S.entryLayerState.waiting;
-        }
-        return false;
+        return S.entryLayerState.waiting;
     }
-
     function updateEntryLayer(isWin) {
         if (cfg.entryLayer === 2) {
-            if (isWin) S.entryLayerState.waiting = true;
-            else S.entryLayerState.waiting = false;
+            S.entryLayerState.waiting = isWin ? true : false;
         } else if (cfg.entryLayer === 3) {
-            if (isWin) {
-                S.entryLayerState.waiting = true;
-                S.entryLayerState.lossStreak = 0;
-            } else {
+            if (isWin) { S.entryLayerState.waiting = true; S.entryLayerState.lossStreak = 0; }
+            else {
                 S.entryLayerState.lossStreak++;
                 if (S.entryLayerState.lossStreak >= 2) S.entryLayerState.waiting = false;
             }
         }
     }
-
     function shouldSkipBySL() {
         if (!cfg.slLayer || cfg.slLayer <= 0) return false;
         return S.skipMode;
     }
-
     function updateSL(isWin) {
         if (!cfg.slLayer || cfg.slLayer <= 0) return;
         if (isWin) {
@@ -610,7 +529,7 @@
             if (S.consecutiveLosses >= cfg.slLayer && !S.skipMode) {
                 S.skipMode = true;
                 S.slSkipWaitingWin = true;
-                log(`SL Layer: ${cfg.slLayer} consecutive losses — skip until win`, 'warn');
+                log(`SL Layer: ${cfg.slLayer} losses — skip until win`, 'warn');
             }
         }
     }
@@ -624,12 +543,10 @@
         S.token = findToken();
         if (!S.token) {
             log('❌ Token not found — login to site first', 'err');
-            stop();
-            return;
+            stop(); return;
         }
         log('🔑 Token OK', 'ok');
 
-        // initial balance
         if (cfg.virtualMode) {
             S.balance = cfg.virtualBalance;
         } else {
@@ -637,41 +554,33 @@
         }
         if (S.balance === null || isNaN(S.balance)) {
             log('❌ Balance fetch failed', 'err');
-            stop();
-            return;
+            stop(); return;
         }
         S.startBalance = S.balance;
         S.profit = 0;
         log(`💳 Start balance: ${S.balance.toFixed(2)}`, 'info');
 
-        // seed history
         const seed = await fetchResults();
         if (Array.isArray(seed) && seed.length) {
             seedResults(seed);
             log(`📊 Seeded ${seed.length} results`, 'info');
         }
 
-        // reset per-run state
         S.lastIssue = null;
         S.consecutiveErrors = 0;
-        S.wins = 0;
-        S.losses = 0;
-
+        S.wins = 0; S.losses = 0;
         let lastWarnTime = 0;
 
         while (S.running && !S.stopRequested) {
             try {
-                // refresh balance
-                if (cfg.virtualMode) {
-                    S.balance = cfg.virtualBalance;
-                } else {
+                if (cfg.virtualMode) S.balance = cfg.virtualBalance;
+                else {
                     const b = await fetchBalance();
                     if (b !== null) S.balance = b;
                 }
                 S.profit = S.balance - S.startBalance;
-                updateStats();
+                UI.updateStats();
 
-                // stop conditions
                 if (cfg.targetProfit > 0 && S.profit >= cfg.targetProfit) {
                     log(`🏆 PROFIT TARGET HIT: +${S.profit.toFixed(2)}`, 'ok');
                     break;
@@ -685,7 +594,6 @@
                     log(`❌ Insufficient balance: ${S.balance} < ${minBet}`, 'err');
                     break;
                 }
-                // balance warning
                 if (!cfg.virtualMode && S.balance < minBet * cfg.balanceWarnRatio) {
                     const now = Date.now();
                     if (now - lastWarnTime > 60000) {
@@ -694,62 +602,31 @@
                     }
                 }
 
-                // current issue
                 const issue = await fetchIssue();
-                if (!issue || issue === S.lastIssue) {
-                    await sleep(1000);
-                    continue;
-                }
+                if (!issue || issue === S.lastIssue) { await sleep(1000); continue; }
 
-                // determine choice
                 let choice, skip = false, skipReason = '';
-
-                if (shouldSkipByEntryLayer()) {
-                    skip = true;
-                    skipReason = 'Entry Layer';
-                } else if (shouldSkipBySL()) {
-                    skip = true;
-                    skipReason = 'SL Layer';
-                } else {
+                if (shouldSkipByEntryLayer()) { skip = true; skipReason = 'Entry Layer'; }
+                else if (shouldSkipBySL()) { skip = true; skipReason = 'SL Layer'; }
+                else {
                     const dec = nextChoice();
-                    if (dec.skip) {
-                        skip = true;
-                        skipReason = dec.reason || 'Strategy Wait';
-                    } else {
-                        choice = dec.ch;
-                    }
+                    if (dec.skip) { skip = true; skipReason = dec.reason || 'Strategy Wait'; }
+                    else choice = dec.ch;
                 }
-
-                // fallback for skip-choice recording
-                if (skip && !choice) {
-                    choice = S.lastResults[S.lastResults.length - 1] || 'B';
-                }
-
-                if (!choice) {
-                    await sleep(1000);
-                    continue;
-                }
+                if (skip && !choice) choice = S.lastResults[S.lastResults.length - 1] || 'B';
+                if (!choice) { await sleep(1000); continue; }
 
                 const map = selectMap();
                 const selectType = map[choice];
-                if (!selectType) {
-                    log(`❌ Invalid choice: ${choice}`, 'err');
-                    await sleep(1500);
-                    continue;
-                }
+                if (!selectType) { log(`❌ Invalid choice: ${choice}`, 'err'); await sleep(1500); continue; }
 
                 const amount = currentBetAmount();
-                const unitAmount = amount;
-                const betCount = 1;
-
-                // display
                 const shortIssue = issue.slice(-5);
                 const displayChoice = cfg.betType === 'COLOR' ? colorName(choice) : (choice === 'B' ? 'BIG' : 'SMALL');
 
                 if (skip) {
                     log(`⏭️ SKIP ${shortIssue} — ${skipReason}`, 'warn');
                     S.lastIssue = issue;
-                    // wait for result to advance
                     await waitForResult(issue);
                     await sleep(cfg.loopDelayMs);
                     continue;
@@ -758,49 +635,36 @@
                 log(`🎯 BET ${shortIssue} — ${displayChoice} ${amount}Ks`, 'info');
 
                 let resp;
-                if (cfg.virtualMode) {
-                    resp = { code: 0, _virtual: true };
-                } else {
-                    resp = await placeBet(issue, selectType, unitAmount, betCount);
-                }
+                if (cfg.virtualMode) resp = { code: 0, _virtual: true };
+                else resp = await placeBet(issue, selectType, amount, 1);
 
                 if (!resp._virtual && resp.code !== 0) {
                     log(`❌ Bet failed: ${resp.msg || resp.error || 'unknown'}`, 'err');
                     S.consecutiveErrors++;
                     if (S.consecutiveErrors >= cfg.maxConsecutiveErrors) {
-                        log('Too many consecutive errors — stop', 'err');
+                        log('Too many errors — stop', 'err');
                         break;
                     }
                     await sleep(2000);
                     continue;
                 }
-
                 S.consecutiveErrors = 0;
                 S.lastIssue = issue;
 
-                // wait for result
                 const settled = await waitForResult(issue);
-                if (!settled) {
-                    log(`⏱️ Result timeout ${shortIssue}`, 'warn');
-                    continue;
-                }
+                if (!settled) { log(`⏱️ Result timeout ${shortIssue}`, 'warn'); continue; }
 
                 const num = String(parseInt(settled.number, 10) % 10);
                 const bs = numberToBS(num);
                 const color = numberToColor(num);
+                const isWin = cfg.betType === 'COLOR' ? choice === color : choice === bs;
 
-                let isWin;
-                if (cfg.betType === 'COLOR') isWin = choice === color;
-                else isWin = choice === bs;
-
-                // update history + strategy state
                 pushResult(num, bs, color, issue);
                 postBetState(choice, isWin, num, issue);
                 updateEntryLayer(isWin);
                 updateSL(isWin);
                 updateBetting(isWin);
 
-                // balance / profit
                 if (cfg.virtualMode) {
                     cfg.virtualBalance += isWin ? amount * 0.96 : -amount;
                     S.balance = cfg.virtualBalance;
@@ -817,7 +681,7 @@
 
                 S.history.unshift({ issue, choice, num, bs, color, isWin, amount, t: Date.now() });
                 if (S.history.length > 30) S.history.pop();
-                updateStats();
+                UI.updateStats();
 
                 await sleep(cfg.loopDelayMs);
             } catch (e) {
@@ -830,7 +694,6 @@
                 await sleep(3000);
             }
         }
-
         log(`=== STOPPED  W:${S.wins} L:${S.losses}  P/L:${S.profit >= 0 ? '+' : ''}${S.profit.toFixed(2)} ===`, 'ok');
         stop();
     }
@@ -849,172 +712,233 @@
     function stop() {
         S.running = false;
         S.stopRequested = true;
-        if (UI.runBtn) UI.runBtn.disabled = false;
-        if (UI.stopBtn) UI.stopBtn.disabled = true;
-        if (UI.statusEl) {
-            UI.statusEl.textContent = 'STOPPED';
-            UI.statusEl.className = 'ab-status stopped';
-        }
-        updateStats();
+        UI.setRunning(false);
+        UI.updateStats();
     }
 
     /* ══════════════════════════════════════════════════════════
-     * 10. UI
+     * 10. UI — Bottom sheet + tabs
      * ══════════════════════════════════════════════════════════ */
-    const UI = {};
+    const UI = {
+        el: {},
+        build() {
+            const root = document.createElement('div');
+            root.id = 'autobet-pro-root';
+            document.body.appendChild(root);
+            this.root = root;
 
-    function buildUI() {
-        const root = document.createElement('div');
-        root.id = 'autobet-pro-root';
-        document.body.appendChild(root);
+            // inject styles
+            const style = document.createElement('style');
+            style.id = 'autobet-pro-style';
+            style.textContent = CSS;
+            document.head.appendChild(style);
 
-        const style = document.createElement('style');
-        style.textContent = `
-            #autobet-pro-root * { box-sizing: border-box; font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
-            #autobet-pro-root .ab-fab {
-                position: fixed; right: 18px; bottom: 18px; z-index: 2147483646;
-                background: linear-gradient(135deg,#e94560,#533483);
-                color:#fff; padding: 12px 20px; border-radius: 32px;
-                font-weight: 700; cursor: pointer; box-shadow: 0 6px 24px rgba(0,0,0,.45);
-                font-size: 14px; user-select: none; letter-spacing: .3px;
-                transition: transform .15s;
-            }
-            #autobet-pro-root .ab-fab:hover { transform: scale(1.06); }
-            #autobet-pro-root .ab-panel {
-                position: fixed; right: 18px; bottom: 76px; z-index: 2147483646;
-                width: 400px; max-height: 82vh; overflow-y: auto;
-                background: #0b1120; color:#e2e8f0;
-                border: 1px solid #1e293b; border-radius: 14px;
-                box-shadow: 0 20px 60px rgba(0,0,0,.7);
-                padding: 16px; font-size: 13px; display: none;
-            }
-            #autobet-pro-root .ab-panel.open { display: block; }
-            #autobet-pro-root .ab-panel::-webkit-scrollbar { width: 6px; }
-            #autobet-pro-root .ab-panel::-webkit-scrollbar-thumb { background:#334155; border-radius:3px; }
-            #autobet-pro-root h3 {
-                margin: 0 0 12px; color:#f43f5e; font-size: 15px;
-                display:flex; align-items:center; justify-content:space-between;
-                padding-bottom: 10px; border-bottom: 1px solid #1e293b;
-            }
-            #autobet-pro-root .ab-close {
-                cursor:pointer; color:#94a3b8; font-size: 22px; line-height: 1;
-                padding: 0 6px; border-radius: 4px;
-            }
-            #autobet-pro-root .ab-close:hover { color:#f43f5e; background:#1e293b; }
-            #autobet-pro-root .ab-status {
-                display:inline-block; padding: 3px 10px; border-radius: 12px;
-                font-size: 10px; font-weight: 700; letter-spacing: .8px;
-                vertical-align: middle; margin-left: 8px;
-            }
-            #autobet-pro-root .ab-status.running { background:#16a34a; color:#fff; }
-            #autobet-pro-root .ab-status.stopped { background:#334155; color:#cbd5e1; }
-            #autobet-pro-root .ab-section {
-                margin: 10px 0; padding: 10px; background:#0f172a;
-                border-radius: 10px; border: 1px solid #1e293b;
-            }
-            #autobet-pro-root .ab-section h4 {
-                margin: 0 0 8px; color:#94a3b8; font-size: 11px;
-                text-transform: uppercase; letter-spacing: 1px;
-            }
-            #autobet-pro-root .ab-row {
-                display:flex; align-items:center; gap:8px; margin-bottom: 6px;
-            }
-            #autobet-pro-root .ab-row label {
-                flex: 0 0 120px; color:#94a3b8; font-size: 12px;
-            }
-            #autobet-pro-root .ab-row input,
-            #autobet-pro-root .ab-row select {
-                flex: 1; background:#1e293b; color:#e2e8f0;
-                border: 1px solid #334155; border-radius: 6px;
-                padding: 6px 8px; font-size: 12px; outline: none;
-                min-width: 0;
-            }
-            #autobet-pro-root .ab-row input:focus,
-            #autobet-pro-root .ab-row select:focus { border-color: #f43f5e; }
-            #autobet-pro-root .ab-row input[type="checkbox"] {
-                flex: 0 0 auto; width: 18px; height: 18px; accent-color:#16a34a;
-            }
-            #autobet-pro-root .ab-btns {
-                display:flex; gap: 8px; margin-top: 12px;
-            }
-            #autobet-pro-root .ab-btns button {
-                flex:1; padding: 10px 8px; border:none; border-radius: 8px;
-                font-weight: 700; cursor: pointer; font-size: 12px;
-                transition: all .15s; letter-spacing: .3px;
-            }
-            #autobet-pro-root button:disabled { opacity: .4; cursor: not-allowed; }
-            #autobet-pro-root .ab-run { background:#16a34a; color:#fff; }
-            #autobet-pro-root .ab-run:hover:not(:disabled) { background:#15803d; }
-            #autobet-pro-root .ab-stop { background:#dc2626; color:#fff; }
-            #autobet-pro-root .ab-stop:hover:not(:disabled) { background:#b91c1c; }
-            #autobet-pro-root .ab-save { background:#2563eb; color:#fff; }
-            #autobet-pro-root .ab-save:hover { background:#1d4ed8; }
-            #autobet-pro-root .ab-reset { background:#475569; color:#fff; }
-            #autobet-pro-root .ab-reset:hover { background:#334155; }
-            #autobet-pro-root .ab-stats {
-                display:grid; grid-template-columns: 1fr 1fr; gap: 6px 12px;
-                font-size: 12px; line-height: 1.5;
-            }
-            #autobet-pro-root .ab-stats span { display:flex; justify-content: space-between; }
-            #autobet-pro-root .ab-stats b { color:#94a3b8; font-weight:500; }
-            #autobet-pro-root .ab-log {
-                height: 200px; overflow-y:auto; background:#020617;
-                border-radius: 8px; padding: 8px; margin-top: 8px;
-                font-family: ui-monospace, Menlo, Consolas, monospace;
-                font-size: 11px; line-height: 1.5;
-                border: 1px solid #1e293b;
-            }
-            #autobet-pro-root .ab-log::-webkit-scrollbar { width:6px; }
-            #autobet-pro-root .ab-log::-webkit-scrollbar-thumb { background:#334155; border-radius:3px; }
-            #autobet-pro-root .ab-line { white-space: pre-wrap; word-break: break-word; }
-            #autobet-pro-root .ab-line.ok { color:#4ade80; }
-            #autobet-pro-root .ab-line.err { color:#f87171; }
-            #autobet-pro-root .ab-line.warn { color:#fbbf24; }
-            #autobet-pro-root .ab-line.info { color:#93c5fd; }
-            #autobet-pro-root .ab-token-warn {
-                background:#7f1d1d; color:#fecaca; padding: 6px 10px;
-                border-radius: 6px; font-size: 11px; margin-bottom: 8px;
-                display:none;
-            }
-            #autobet-pro-root .ab-token-warn.show { display:block; }
-            #autobet-pro-root .ab-mini-stats {
-                display:flex; gap: 12px; font-size: 11px;
-                color: #94a3b8; padding: 6px 0;
-            }
-            #autobet-pro-root .ab-mini-stats b { color:#e2e8f0; }
-        `;
-        root.appendChild(style);
+            // FAB
+            const fab = document.createElement('div');
+            fab.className = 'ab-fab';
+            fab.innerHTML = '<span class="ab-fab-ico">🤖</span><span class="ab-fab-txt">AUTOBET</span>';
+            root.appendChild(fab);
+            this.el.fab = fab;
 
-        const fab = document.createElement('div');
-        fab.className = 'ab-fab';
-        fab.textContent = '🤖 AUTOBET';
-        root.appendChild(fab);
+            // Panel
+            const panel = document.createElement('div');
+            panel.className = 'ab-panel';
+            panel.innerHTML = TEMPLATE;
+            root.appendChild(panel);
+            this.el.panel = panel;
 
-        const panel = document.createElement('div');
-        panel.className = 'ab-panel';
-        panel.innerHTML = `
-            <h3>
-                🤖 AUTOBET PRO
-                <span>
-                    <span class="ab-status stopped" data-el="status">STOPPED</span>
-                    <span class="ab-close" data-el="close">×</span>
-                </span>
-            </h3>
+            // Cache refs
+            const $ = sel => panel.querySelector(sel);
+            this.el.status = $('[data-el="status"]');
+            this.el.tokenWarn = $('[data-el="tokenWarn"]');
+            this.el.tabs = panel.querySelectorAll('.ab-tab');
+            this.el.tabPanes = panel.querySelectorAll('.ab-tabpane');
+            this.el.log = $('[data-el="log"]');
+            this.el.runBtn = $('[data-el="runBtn"]');
+            this.el.stopBtn = $('[data-el="stopBtn"]');
+            this.el.saveBtn = $('[data-el="saveBtn"]');
+            this.el.stat = {
+                balance: $('[data-el="st-balance"]'),
+                profit: $('[data-el="st-profit"]'),
+                wins: $('[data-el="st-wins"]'),
+                losses: $('[data-el="st-losses"]'),
+                ratio: $('[data-el="st-ratio"]'),
+                streak: $('[data-el="st-streak"]'),
+                last: $('[data-el="st-last"]')
+            };
 
-            <div class="ab-token-warn" data-el="tokenWarn">
-                ⚠️ No token found — please log in to the site first
+            // Events
+            fab.addEventListener('click', () => this.toggle());
+            $('[data-el="close"]').addEventListener('click', () => this.close());
+            this.el.tabs.forEach(tab => tab.addEventListener('click', () => this.switchTab(tab.dataset.tab)));
+            this.el.saveBtn.addEventListener('click', () => { this.readConfig(); log('💾 Saved', 'ok'); });
+            this.el.runBtn.addEventListener('click', () => this.startRun());
+            this.el.stopBtn.addEventListener('click', () => { log('⏹ Stop requested', 'warn'); S.stopRequested = true; S.running = false; });
+            $('[data-el="resetBtn"]').addEventListener('click', () => {
+                S.wins = 0; S.losses = 0; S.profit = 0; S.history = [];
+                this.updateStats();
+                log('🔄 Stats reset', 'warn');
+            });
+            $('[data-el="clearLogBtn"]').addEventListener('click', () => { this.el.log.innerHTML = ''; S.logs = []; });
+            $('[data-el="copyLogBtn"]').addEventListener('click', () => {
+                const text = S.logs.map(l => `[${l.t}] ${l.m}`).join('\n');
+                navigator.clipboard.writeText(text).then(() => log('📋 Log copied', 'ok')).catch(() => {});
+            });
+
+            // token watcher
+            setInterval(() => {
+                if (S.running) return;
+                const t = findToken();
+                this.el.tokenWarn.classList.toggle('show', !t);
+            }, 5000);
+
+            this.writeConfig();
+            this.updateStats();
+            this.switchTab('game');
+            this.el.tokenWarn.classList.toggle('show', !findToken());
+            log('Panel ready — login to site, then ▶ Run', 'info');
+        },
+
+        open() { this.el.panel.classList.add('open'); },
+        close() { this.el.panel.classList.remove('open'); },
+        toggle() { this.el.panel.classList.toggle('open'); },
+
+        switchTab(name) {
+            this.el.tabs.forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+            this.el.tabPanes.forEach(p => p.classList.toggle('active', p.dataset.pane === name));
+        },
+
+        pushLog(line) {
+            if (!this.el.log) return;
+            const d = document.createElement('div');
+            d.className = 'ab-line ' + line.c;
+            d.textContent = `[${line.t}] ${line.m}`;
+            this.el.log.appendChild(d);
+            this.el.log.scrollTop = this.el.log.scrollHeight;
+            while (this.el.log.children.length > 300) this.el.log.removeChild(this.el.log.firstChild);
+        },
+
+        setRunning(on) {
+            this.el.status.textContent = on ? 'RUNNING' : 'STOPPED';
+            this.el.status.className = 'ab-status ' + (on ? 'running' : 'stopped');
+            this.el.runBtn.disabled = on;
+            this.el.stopBtn.disabled = !on;
+        },
+
+        updateStats() {
+            const e = this.el.stat;
+            e.balance.textContent = S.balance !== null ? S.balance.toFixed(2) : '—';
+            e.profit.textContent = (S.profit >= 0 ? '+' : '') + (S.profit || 0).toFixed(2);
+            e.profit.className = S.profit > 0 ? 'ok' : S.profit < 0 ? 'err' : '';
+            e.wins.textContent = S.wins;
+            e.losses.textContent = S.losses;
+            const total = S.wins + S.losses;
+            e.ratio.textContent = total ? `${S.wins}/${total}` : '—';
+            let streak = 0, lastWin = null;
+            for (const h of S.history) {
+                if (lastWin === null) { lastWin = h.isWin; streak = 1; }
+                else if (h.isWin === lastWin) streak++;
+                else break;
+            }
+            e.streak.textContent = lastWin === null ? '—' : (lastWin ? `+${streak}W` : `-${streak}L`);
+            e.streak.className = lastWin === false ? 'err' : lastWin === true ? 'ok' : '';
+            const last = S.history[0];
+            e.last.textContent = last ? `${last.num} ${last.bs}` : '—';
+        },
+
+        writeConfig() {
+            this.el.panel.querySelectorAll('[data-cfg]').forEach(el => {
+                const k = el.dataset.cfg;
+                const v = cfg[k];
+                if (el.type === 'checkbox') el.checked = !!v;
+                else if (k === 'betSizes') el.value = (v || []).join(',');
+                else el.value = v ?? '';
+            });
+        },
+
+        readConfig() {
+            this.el.panel.querySelectorAll('[data-cfg]').forEach(el => {
+                const k = el.dataset.cfg;
+                let v;
+                if (el.type === 'checkbox') v = el.checked;
+                else if (el.type === 'number') v = parseFloat(el.value) || 0;
+                else v = el.value;
+                if (k === 'betSizes') {
+                    v = String(v).split(',').map(x => parseInt(x.trim(), 10)).filter(n => !isNaN(n) && n > 0);
+                    if (!v.length) v = [100];
+                }
+                if (['entryLayer', 'slLayer', 'trendWaitCount', 'alternateWaitCount'].includes(k)) v = parseInt(v, 10) || 0;
+                cfg[k] = v;
+            });
+            localStorage.setItem(LS_KEY, JSON.stringify(cfg));
+        },
+
+        startRun() {
+            if (S.running) return;
+            this.readConfig();
+            S.running = true;
+            S.stopRequested = false;
+            S.wins = 0; S.losses = 0; S.profit = 0; S.history = [];
+            S.martinIndex = 0; S.dalembertUnits = 1; S.customIdx = 0;
+            S.patternIdx = 0; S.customPatternIdx = 0;
+            S.consecutiveLosses = 0; S.skipMode = false; S.slSkipWaitingWin = false;
+            S.entryLayerState = { waiting: cfg.entryLayer > 1, lossStreak: 0 };
+            S.sniper = { active: false, dir: null, idx: 0, seq: [], hits: 0 };
+            S.dream = { first: true, pattern: null, idx: 0 };
+            S.leo = { idx: 0 };
+            S.babio = { pos: 8 };
+            S.beatrix = { waiting: true, period: null };
+            S.colorTrend = { last: null };
+            S.trendState = { last: null, skip: false };
+            S.altState = { last: null, skip: false };
+            S.lastResults = []; S.lastNumbers = []; S.lastColors = []; S.rawHistory = [];
+            S.lastIssue = null;
+            S.consecutiveErrors = 0;
+
+            this.setRunning(true);
+            this.updateStats();
+            ensureMd5().then(() => mainLoop()).catch(e => {
+                log('❌ MD5 load failed: ' + e.message, 'err');
+                stop();
+            });
+        }
+    };
+
+    /* ── Template ─────────────────────────────────────────────── */
+    const TEMPLATE = `
+        <div class="ab-header">
+            <div class="ab-title">
+                <span class="ab-dot"></span>
+                <span>AUTOBET PRO</span>
+                <span class="ab-status stopped" data-el="status">STOPPED</span>
             </div>
+            <div class="ab-close" data-el="close">✕</div>
+        </div>
 
-            <div class="ab-section">
-                <h4>Game</h4>
-                <div class="ab-row">
+        <div class="ab-token-warn" data-el="tokenWarn">
+            ⚠️ No token — please log in to the site first
+        </div>
+
+        <div class="ab-tabs">
+            <div class="ab-tab active" data-tab="game">🎮 Game</div>
+            <div class="ab-tab" data-tab="strategy">🧠 Strategy</div>
+            <div class="ab-tab" data-tab="bet">💰 Bet</div>
+            <div class="ab-tab" data-tab="risk">🛡 Risk</div>
+            <div class="ab-tab" data-tab="log">📋 Log</div>
+        </div>
+
+        <div class="ab-body">
+
+            <!-- GAME TAB -->
+            <div class="ab-tabpane active" data-pane="game">
+                <div class="ab-field">
                     <label>Site</label>
                     <select data-cfg="site">
                         <option value="6Lottery">6Lottery</option>
                         <option value="777BIGWIN">777BIGWIN</option>
                     </select>
                 </div>
-                <div class="ab-row">
+                <div class="ab-field">
                     <label>Game Type</label>
                     <select data-cfg="gameType">
                         <option value="TRX">TRX 1min</option>
@@ -1024,18 +948,30 @@
                         <option value="WINGO_5MIN">WINGO 5min</option>
                     </select>
                 </div>
-                <div class="ab-row">
+                <div class="ab-field">
                     <label>Bet Type</label>
                     <select data-cfg="betType">
                         <option value="BS">Big / Small</option>
-                        <option value="COLOR">Color</option>
+                        <option value="COLOR">Color (R/G/V)</option>
                     </select>
+                </div>
+                <div class="ab-field ab-switch">
+                    <label>Virtual Mode</label>
+                    <input type="checkbox" data-cfg="virtualMode">
+                </div>
+                <div class="ab-field">
+                    <label>Virtual Balance</label>
+                    <input type="number" data-cfg="virtualBalance">
+                </div>
+                <div class="ab-field">
+                    <label>Loop Delay (ms)</label>
+                    <input type="number" data-cfg="loopDelayMs">
                 </div>
             </div>
 
-            <div class="ab-section">
-                <h4>Strategy</h4>
-                <div class="ab-row">
+            <!-- STRATEGY TAB -->
+            <div class="ab-tabpane" data-pane="strategy">
+                <div class="ab-field">
                     <label>Strategy</label>
                     <select data-cfg="strategy">
                         <option value="BS_ORDER">BS Order</option>
@@ -1052,28 +988,28 @@
                         <option value="SNIPER">Sniper</option>
                     </select>
                 </div>
-                <div class="ab-row">
+                <div class="ab-field">
                     <label>BS Pattern</label>
                     <input data-cfg="bsPattern" placeholder="BSBSBSBSBS">
                 </div>
-                <div class="ab-row">
+                <div class="ab-field">
                     <label>Custom Pattern</label>
                     <input data-cfg="customBetPattern" placeholder="B,S,B,B,S">
                 </div>
-                <div class="ab-row">
+                <div class="ab-field">
                     <label>Trend Wait</label>
-                    <input data-cfg="trendWaitCount" type="number" min="0" max="9">
+                    <input type="number" min="0" max="9" data-cfg="trendWaitCount">
                 </div>
-                <div class="ab-row">
+                <div class="ab-field">
                     <label>Alt Wait</label>
-                    <input data-cfg="alternateWaitCount" type="number" min="0" max="9">
+                    <input type="number" min="0" max="9" data-cfg="alternateWaitCount">
                 </div>
             </div>
 
-            <div class="ab-section">
-                <h4>Betting Strategy</h4>
-                <div class="ab-row">
-                    <label>Method</label>
+            <!-- BET TAB -->
+            <div class="ab-tabpane" data-pane="bet">
+                <div class="ab-field">
+                    <label>Betting Method</label>
                     <select data-cfg="bettingStrategy">
                         <option value="Martingale">Martingale</option>
                         <option value="Anti-Martingale">Anti-Martingale</option>
@@ -1081,31 +1017,35 @@
                         <option value="Custom">Custom</option>
                     </select>
                 </div>
-                <div class="ab-row">
-                    <label>Bet Wrager</label>
+                <div class="ab-field">
+                    <label>Bet Wrager (comma)</label>
                     <input data-cfg="betSizes" placeholder="100,300,500,900">
+                </div>
+                <div class="ab-hint">
+                    💡 Martingale: lose ရင် index တက်၊ win ရင် reset<br>
+                    💡 D'Alembert: unit × wrager (လုံးတစ်ခုတည်း)
                 </div>
             </div>
 
-            <div class="ab-section">
-                <h4>Risk Control</h4>
-                <div class="ab-row">
+            <!-- RISK TAB -->
+            <div class="ab-tabpane" data-pane="risk">
+                <div class="ab-field">
                     <label>Target Profit</label>
-                    <input data-cfg="targetProfit" type="number">
+                    <input type="number" data-cfg="targetProfit">
                 </div>
-                <div class="ab-row">
+                <div class="ab-field">
                     <label>Stop Loss</label>
-                    <input data-cfg="stopLoss" type="number">
+                    <input type="number" data-cfg="stopLoss">
                 </div>
-                <div class="ab-row">
+                <div class="ab-field">
                     <label>Entry Layer</label>
                     <select data-cfg="entryLayer">
-                        <option value="1">1 — Direct Bet</option>
+                        <option value="1">1 — Direct</option>
                         <option value="2">2 — Wait 1 Lose</option>
                         <option value="3">3 — Wait 2 Loses</option>
                     </select>
                 </div>
-                <div class="ab-row">
+                <div class="ab-field">
                     <label>SL Layer</label>
                     <select data-cfg="slLayer">
                         <option value="0">Disabled</option>
@@ -1118,196 +1058,289 @@
                 </div>
             </div>
 
-            <div class="ab-section">
-                <h4>Mode</h4>
-                <div class="ab-row">
-                    <label>Virtual Mode</label>
-                    <input data-cfg="virtualMode" type="checkbox">
-                </div>
-                <div class="ab-row">
-                    <label>Virtual Balance</label>
-                    <input data-cfg="virtualBalance" type="number">
-                </div>
-                <div class="ab-row">
-                    <label>Loop Delay (ms)</label>
-                    <input data-cfg="loopDelayMs" type="number">
-                </div>
-            </div>
-
-            <div class="ab-btns">
-                <button class="ab-save" data-el="saveBtn">💾 Save</button>
-                <button class="ab-run" data-el="runBtn">▶ Run</button>
-                <button class="ab-stop" data-el="stopBtn" disabled>■ Stop</button>
-            </div>
-            <div class="ab-btns" style="margin-top:8px">
-                <button class="ab-reset" data-el="resetBtn">🔄 Reset Stats</button>
-                <button class="ab-reset" data-el="clearLogBtn">🗑 Clear Log</button>
-            </div>
-
-            <div class="ab-section" style="margin-top:10px">
-                <h4>Live Stats</h4>
+            <!-- LOG TAB -->
+            <div class="ab-tabpane" data-pane="log">
                 <div class="ab-stats">
-                    <span><b>Balance</b><span data-el="st-balance">—</span></span>
-                    <span><b>Profit</b><span data-el="st-profit">—</span></span>
-                    <span><b>Wins</b><span data-el="st-wins">0</span></span>
-                    <span><b>Losses</b><span data-el="st-losses">0</span></span>
-                    <span><b>W/L Ratio</b><span data-el="st-ratio">—</span></span>
-                    <span><b>Streak</b><span data-el="st-streak">—</span></span>
+                    <div class="ab-stat"><b>Balance</b><span data-el="st-balance">—</span></div>
+                    <div class="ab-stat"><b>Profit</b><span data-el="st-profit">—</span></div>
+                    <div class="ab-stat"><b>Wins</b><span data-el="st-wins">0</span></div>
+                    <div class="ab-stat"><b>Losses</b><span data-el="st-losses">0</span></div>
+                    <div class="ab-stat"><b>Ratio</b><span data-el="st-ratio">—</span></div>
+                    <div class="ab-stat"><b>Streak</b><span data-el="st-streak">—</span></div>
+                    <div class="ab-stat"><b>Last</b><span data-el="st-last">—</span></div>
                 </div>
                 <div class="ab-log" data-el="log"></div>
+                <div class="ab-btns">
+                    <button class="ab-btn ab-btn-ghost" data-el="copyLogBtn">📋 Copy</button>
+                    <button class="ab-btn ab-btn-ghost" data-el="clearLogBtn">🗑 Clear</button>
+                </div>
             </div>
-        `;
-        root.appendChild(panel);
 
-        // refs
-        UI.root = root;
-        UI.fab = fab;
-        UI.panel = panel;
-        UI.statusEl = panel.querySelector('[data-el="status"]');
-        UI.logEl = panel.querySelector('[data-el="log"]');
-        UI.runBtn = panel.querySelector('[data-el="runBtn"]');
-        UI.stopBtn = panel.querySelector('[data-el="stopBtn"]');
-        UI.saveBtn = panel.querySelector('[data-el="saveBtn"]');
-        UI.resetBtn = panel.querySelector('[data-el="resetBtn"]');
-        UI.clearLogBtn = panel.querySelector('[data-el="clearLogBtn"]');
-        UI.tokenWarn = panel.querySelector('[data-el="tokenWarn"]');
-        UI.statEls = {
-            balance: panel.querySelector('[data-el="st-balance"]'),
-            profit: panel.querySelector('[data-el="st-profit"]'),
-            wins: panel.querySelector('[data-el="st-wins"]'),
-            losses: panel.querySelector('[data-el="st-losses"]'),
-            ratio: panel.querySelector('[data-el="st-ratio"]'),
-            streak: panel.querySelector('[data-el="st-streak"]')
-        };
+        </div>
 
-        // wire
-        fab.addEventListener('click', () => panel.classList.toggle('open'));
-        panel.querySelector('[data-el="close"]').addEventListener('click', () => panel.classList.remove('open'));
+        <div class="ab-footer">
+            <button class="ab-btn ab-btn-save" data-el="saveBtn">💾 Save</button>
+            <button class="ab-btn ab-btn-run" data-el="runBtn">▶ Run</button>
+            <button class="ab-btn ab-btn-stop" data-el="stopBtn" disabled>■ Stop</button>
+        </div>
+    `;
 
-        UI.saveBtn.addEventListener('click', () => {
-            readConfigFromUI();
-            log('💾 Settings saved', 'ok');
-        });
-        UI.runBtn.addEventListener('click', startRun);
-        UI.stopBtn.addEventListener('click', () => {
-            log('⏹ Stop requested', 'warn');
-            S.stopRequested = true;
-            S.running = false;
-        });
-        UI.resetBtn.addEventListener('click', () => {
-            S.wins = 0; S.losses = 0; S.profit = 0; S.history = [];
-            updateStats();
-            log('🔄 Stats reset', 'warn');
-        });
-        UI.clearLogBtn.addEventListener('click', () => {
-            UI.logEl.innerHTML = '';
-            S.logs = [];
-        });
-
-        // detect token every 5s and warn
-        setInterval(() => {
-            if (S.running) return;
-            const t = findToken();
-            UI.tokenWarn.classList.toggle('show', !t);
-        }, 5000);
-
-        writeConfigToUI();
-        updateStats();
-        log('Panel ready. Login to site, then click ▶ Run', 'info');
-    }
-
-    function writeConfigToUI() {
-        UI.panel.querySelectorAll('[data-cfg]').forEach(el => {
-            const key = el.dataset.cfg;
-            const v = cfg[key];
-            if (el.type === 'checkbox') el.checked = !!v;
-            else if (key === 'betSizes') el.value = (v || []).join(',');
-            else el.value = v ?? '';
-        });
-    }
-
-    function readConfigFromUI() {
-        UI.panel.querySelectorAll('[data-cfg]').forEach(el => {
-            const key = el.dataset.cfg;
-            let v;
-            if (el.type === 'checkbox') v = el.checked;
-            else if (el.type === 'number') v = parseFloat(el.value) || 0;
-            else v = el.value;
-            if (key === 'betSizes') {
-                v = String(v).split(',').map(x => parseInt(x.trim(), 10)).filter(n => !isNaN(n) && n > 0);
-                if (!v.length) v = [100];
-            }
-            if (key === 'entryLayer' || key === 'slLayer') v = parseInt(v, 10);
-            if (key === 'trendWaitCount' || key === 'alternateWaitCount') v = parseInt(v, 10) || 0;
-            cfg[key] = v;
-        });
-        localStorage.setItem(LS_KEY, JSON.stringify(cfg));
-    }
-
-    function updateStats() {
-        if (!UI.statEls) return;
-        UI.statEls.balance.textContent = S.balance !== null ? S.balance.toFixed(2) : '—';
-        UI.statEls.profit.textContent = (S.profit >= 0 ? '+' : '') + (S.profit || 0).toFixed(2);
-        UI.statEls.wins.textContent = S.wins;
-        UI.statEls.losses.textContent = S.losses;
-        const total = S.wins + S.losses;
-        UI.statEls.ratio.textContent = total ? `${S.wins}/${total}` : '—';
-        // current streak
-        let streak = 0, lastWin = null;
-        for (const h of S.history) {
-            if (lastWin === null) { lastWin = h.isWin; streak = 1; }
-            else if (h.isWin === lastWin) streak++;
-            else break;
+    /* ── CSS ─────────────────────────────────────────────────── */
+    const CSS = `
+        #autobet-pro-root, #autobet-pro-root * {
+            box-sizing: border-box;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            -webkit-tap-highlight-color: transparent;
         }
-        UI.statEls.streak.textContent = lastWin === null ? '—' : (lastWin ? `+${streak}W` : `-${streak}L`);
-    }
+        #autobet-pro-root .ab-fab {
+            position: fixed; right: 12px; bottom: 12px; z-index: 2147483646;
+            display: flex; align-items: center; gap: 6px;
+            background: linear-gradient(135deg, #f43f5e 0%, #a855f7 100%);
+            color: #fff; padding: 10px 16px; border-radius: 30px;
+            font-weight: 700; font-size: 13px; letter-spacing: .5px;
+            cursor: pointer; user-select: none;
+            box-shadow: 0 6px 20px rgba(244,63,94,.45), 0 2px 6px rgba(0,0,0,.3);
+            transition: transform .15s ease;
+        }
+        #autobet-pro-root .ab-fab:active { transform: scale(.96); }
+        #autobet-pro-root .ab-fab-ico { font-size: 16px; }
 
-    function startRun() {
-        if (S.running) return;
-        readConfigFromUI();
-        // reset run state
-        S.running = true;
-        S.stopRequested = false;
-        S.wins = 0; S.losses = 0; S.profit = 0; S.history = [];
-        S.martinIndex = 0; S.dalembertUnits = 1; S.customIdx = 0;
-        S.patternIdx = 0; S.customPatternIdx = 0;
-        S.consecutiveLosses = 0; S.skipMode = false; S.slSkipWaitingWin = false;
-        S.entryLayerState = { waiting: cfg.entryLayer > 1, lossStreak: 0 };
-        S.sniper = { active: false, dir: null, idx: 0, seq: [], hits: 0, sameResult: false };
-        S.dream = { first: true, pattern: null, idx: 0 };
-        S.leo = { idx: 0 };
-        S.babio = { pos: 8 };
-        S.beatrix = { waiting: true, period: null };
-        S.colorTrend = { last: null };
-        S.trendState = { last: null, skip: false };
-        S.altState = { last: null, skip: false };
-        S.lastResults = []; S.lastNumbers = []; S.lastColors = []; S.rawHistory = [];
-        S.lastIssue = null;
-        S.consecutiveErrors = 0;
+        #autobet-pro-root .ab-panel {
+            position: fixed; z-index: 2147483646;
+            left: 0; right: 0; bottom: 0;
+            max-height: 88vh;
+            background: #0b1120;
+            color: #e2e8f0;
+            border-radius: 18px 18px 0 0;
+            box-shadow: 0 -12px 40px rgba(0,0,0,.6);
+            display: flex; flex-direction: column;
+            transform: translateY(110%);
+            transition: transform .28s cubic-bezier(.32,.72,0,1);
+            overflow: hidden;
+            font-size: 13px;
+            border-top: 1px solid #1e293b;
+        }
+        #autobet-pro-root .ab-panel.open { transform: translateY(0); }
 
-        UI.runBtn.disabled = true;
-        UI.stopBtn.disabled = false;
-        UI.statusEl.textContent = 'RUNNING';
-        UI.statusEl.className = 'ab-status running';
-        updateStats();
+        @media (min-width: 720px) {
+            #autobet-pro-root .ab-panel {
+                left: auto; right: 18px; bottom: 70px;
+                width: 400px; max-height: 80vh;
+                border-radius: 14px;
+                border: 1px solid #1e293b;
+                transform: translateY(20px);
+                opacity: 0; pointer-events: none;
+                transition: opacity .2s, transform .2s;
+            }
+            #autobet-pro-root .ab-panel.open { transform: translateY(0); opacity: 1; pointer-events: auto; }
+        }
 
-        ensureMd5().then(() => mainLoop()).catch(e => {
-            log('❌ MD5 load failed: ' + e.message, 'err');
-            stop();
-        });
-    }
+        #autobet-pro-root .ab-header {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 12px 14px 10px;
+            border-bottom: 1px solid #1e293b;
+            flex-shrink: 0;
+        }
+        #autobet-pro-root .ab-title {
+            display: flex; align-items: center; gap: 8px;
+            font-weight: 700; font-size: 13px; letter-spacing: .8px;
+            color: #f1f5f9;
+        }
+        #autobet-pro-root .ab-dot {
+            width: 8px; height: 8px; border-radius: 50%;
+            background: #f43f5e;
+            box-shadow: 0 0 8px #f43f5e;
+        }
+        #autobet-pro-root .ab-status {
+            display: inline-block;
+            padding: 2px 8px; border-radius: 10px;
+            font-size: 9px; font-weight: 800; letter-spacing: 1px;
+        }
+        #autobet-pro-root .ab-status.running {
+            background: #16a34a; color: #fff;
+            animation: ab-pulse 1.5s ease-in-out infinite;
+        }
+        #autobet-pro-root .ab-status.stopped { background: #334155; color: #cbd5e1; }
+        @keyframes ab-pulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(22,163,74,.6); }
+            50% { box-shadow: 0 0 0 6px rgba(22,163,74,0); }
+        }
+        #autobet-pro-root .ab-close {
+            cursor: pointer; color: #64748b; font-size: 18px;
+            width: 28px; height: 28px; display: flex; align-items: center; justify-content: center;
+            border-radius: 8px; transition: all .15s;
+        }
+        #autobet-pro-root .ab-close:hover { background: #1e293b; color: #f43f5e; }
+
+        #autobet-pro-root .ab-token-warn {
+            background: linear-gradient(90deg, #7f1d1d, #991b1b);
+            color: #fecaca; padding: 8px 14px; font-size: 11px;
+            border-bottom: 1px solid #991b1b;
+            display: none; flex-shrink: 0;
+        }
+        #autobet-pro-root .ab-token-warn.show { display: block; }
+
+        #autobet-pro-root .ab-tabs {
+            display: flex; padding: 6px 8px 0; gap: 2px;
+            border-bottom: 1px solid #1e293b;
+            overflow-x: auto; flex-shrink: 0;
+            scrollbar-width: none;
+        }
+        #autobet-pro-root .ab-tabs::-webkit-scrollbar { display: none; }
+        #autobet-pro-root .ab-tab {
+            flex: 0 0 auto;
+            padding: 8px 12px;
+            font-size: 11.5px; font-weight: 600;
+            color: #64748b; cursor: pointer;
+            border-radius: 8px 8px 0 0;
+            white-space: nowrap;
+            transition: all .15s;
+            border-bottom: 2px solid transparent;
+        }
+        #autobet-pro-root .ab-tab:active { background: #1e293b; }
+        #autobet-pro-root .ab-tab.active {
+            color: #f43f5e;
+            border-bottom-color: #f43f5e;
+            background: linear-gradient(180deg, transparent, rgba(244,63,94,.08));
+        }
+
+        #autobet-pro-root .ab-body {
+            flex: 1; overflow-y: auto;
+            padding: 14px;
+            -webkit-overflow-scrolling: touch;
+        }
+        #autobet-pro-root .ab-body::-webkit-scrollbar { width: 4px; }
+        #autobet-pro-root .ab-body::-webkit-scrollbar-thumb { background: #334155; border-radius: 2px; }
+
+        #autobet-pro-root .ab-tabpane { display: none; }
+        #autobet-pro-root .ab-tabpane.active { display: block; animation: ab-fadein .2s; }
+        @keyframes ab-fadein { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+
+        #autobet-pro-root .ab-field {
+            display: flex; align-items: center;
+            gap: 10px; margin-bottom: 10px;
+        }
+        #autobet-pro-root .ab-field label {
+            flex: 0 0 112px;
+            font-size: 11.5px; color: #94a3b8; font-weight: 500;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        #autobet-pro-root .ab-field input,
+        #autobet-pro-root .ab-field select {
+            flex: 1; min-width: 0;
+            background: #1e293b; color: #e2e8f0;
+            border: 1px solid #334155; border-radius: 8px;
+            padding: 9px 10px;
+            font-size: 13px; outline: none;
+            transition: border-color .15s, background .15s;
+            font-family: inherit;
+        }
+        #autobet-pro-root .ab-field input:focus,
+        #autobet-pro-root .ab-field select:focus {
+            border-color: #f43f5e;
+            background: #1a2438;
+        }
+        #autobet-pro-root .ab-field input[type="checkbox"] {
+            flex: 0 0 auto; width: 22px; height: 22px;
+            accent-color: #16a34a; cursor: pointer;
+            padding: 0; margin: 0;
+        }
+        #autobet-pro-root .ab-switch label { color: #e2e8f0; }
+
+        #autobet-pro-root .ab-hint {
+            font-size: 11px; color: #64748b;
+            background: #0f172a; padding: 10px 12px;
+            border-radius: 8px; line-height: 1.6;
+            border-left: 3px solid #f43f5e; margin-top: 8px;
+        }
+
+        #autobet-pro-root .ab-stats {
+            display: grid; grid-template-columns: 1fr 1fr;
+            gap: 8px; margin-bottom: 10px;
+        }
+        #autobet-pro-root .ab-stat {
+            display: flex; justify-content: space-between; align-items: center;
+            background: #0f172a; padding: 8px 10px;
+            border-radius: 8px; border: 1px solid #1e293b;
+            font-size: 12px;
+        }
+        #autobet-pro-root .ab-stat b { color: #64748b; font-weight: 500; font-size: 11px; }
+        #autobet-pro-root .ab-stat span { color: #e2e8f0; font-weight: 600; }
+        #autobet-pro-root .ab-stat span.ok { color: #4ade80; }
+        #autobet-pro-root .ab-stat span.err { color: #f87171; }
+
+        #autobet-pro-root .ab-log {
+            height: 220px; overflow-y: auto;
+            background: #020617; border: 1px solid #1e293b;
+            border-radius: 10px; padding: 10px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 11px; line-height: 1.55;
+        }
+        #autobet-pro-root .ab-log::-webkit-scrollbar { width: 4px; }
+        #autobet-pro-root .ab-log::-webkit-scrollbar-thumb { background: #334155; border-radius: 2px; }
+        #autobet-pro-root .ab-line { white-space: pre-wrap; word-break: break-word; }
+        #autobet-pro-root .ab-line.ok { color: #4ade80; }
+        #autobet-pro-root .ab-line.err { color: #f87171; }
+        #autobet-pro-root .ab-line.warn { color: #fbbf24; }
+        #autobet-pro-root .ab-line.info { color: #93c5fd; }
+
+        #autobet-pro-root .ab-footer {
+            display: flex; gap: 8px;
+            padding: 10px 14px;
+            padding-bottom: max(10px, env(safe-area-inset-bottom));
+            border-top: 1px solid #1e293b;
+            background: #0b1120;
+            flex-shrink: 0;
+        }
+        #autobet-pro-root .ab-btn {
+            flex: 1;
+            padding: 11px 8px;
+            border: none; border-radius: 10px;
+            font-weight: 700; font-size: 12.5px;
+            cursor: pointer; letter-spacing: .3px;
+            transition: all .15s;
+            font-family: inherit;
+        }
+        #autobet-pro-root .ab-btn:active:not(:disabled) { transform: scale(.97); }
+        #autobet-pro-root .ab-btn:disabled { opacity: .35; cursor: not-allowed; }
+        #autobet-pro-root .ab-btn-save { background: #1e293b; color: #cbd5e1; }
+        #autobet-pro-root .ab-btn-save:hover:not(:disabled) { background: #334155; }
+        #autobet-pro-root .ab-btn-run {
+            background: linear-gradient(135deg, #16a34a, #15803d);
+            color: #fff;
+            box-shadow: 0 4px 12px rgba(22,163,74,.35);
+        }
+        #autobet-pro-root .ab-btn-run:hover:not(:disabled) { box-shadow: 0 6px 16px rgba(22,163,74,.5); }
+        #autobet-pro-root .ab-btn-stop {
+            background: linear-gradient(135deg, #dc2626, #b91c1c);
+            color: #fff;
+            box-shadow: 0 4px 12px rgba(220,38,38,.35);
+        }
+        #autobet-pro-root .ab-btn-ghost {
+            background: #1e293b; color: #94a3b8;
+            font-size: 11px; padding: 8px;
+        }
+        #autobet-pro-root .ab-btn-ghost:hover { background: #334155; color: #e2e8f0; }
+
+        #autobet-pro-root .ab-btns {
+            display: flex; gap: 8px; margin-top: 8px;
+        }
+
+        @media (max-width: 380px) {
+            #autobet-pro-root .ab-field label { flex: 0 0 96px; font-size: 11px; }
+            #autobet-pro-root .ab-body { padding: 12px; }
+            #autobet-pro-root .ab-tab { padding: 7px 10px; font-size: 11px; }
+        }
+    `;
 
     /* ══════════════════════════════════════════════════════════
      * 11. INIT
      * ══════════════════════════════════════════════════════════ */
     function init() {
-        if (!document.body) {
-            document.addEventListener('DOMContentLoaded', init);
-            return;
-        }
-        buildUI();
-        window.__AUTOBET_PRO__ = { panel: UI.panel, state: S, cfg, log, start: startRun, stop };
-        console.log('%c[AUTOBET PRO] ready — click 🤖 button', 'color:#f43f5e;font-weight:bold');
+        if (!document.body) { document.addEventListener('DOMContentLoaded', init); return; }
+        UI.build();
+        window.__AUTOBET_PRO__ = { ui: UI, state: S, cfg, log, start: () => UI.startRun(), stop };
+        console.log('%c[AUTOBET PRO] ready — click 🤖 button', 'color:#f43f5e;font-weight:bold;font-size:13px');
     }
 
     init();
